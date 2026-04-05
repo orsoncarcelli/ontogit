@@ -23,6 +23,9 @@ from pygments.lexers import get_lexer_for_filename, TextLexer
 import markdown
 
 MAX_DEFAULT_BYTES = 50 * 1024
+CHARS_PER_TOKEN = 4
+MIN_KEEP_LINES = 20
+DEFAULT_MAX_TOKENS = 0  # 0 = unlimited
 BINARY_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
     ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
@@ -111,12 +114,29 @@ def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> 
     return FileInfo(path, rel, size, RenderDecision(True, "ok"))
 
 
-def collect_files(repo_root: pathlib.Path, max_bytes: int) -> List[FileInfo]:
+def git_tracked_files(repo_root: pathlib.Path) -> set[str] | None:
+    """Return set of git-tracked relative paths, or None if not a git repo."""
+    try:
+        cp = run(["git", "ls-files"], cwd=str(repo_root))
+        return {line for line in cp.stdout.splitlines() if line}
+    except Exception:
+        return None
+
+
+def collect_files(repo_root: pathlib.Path, max_bytes: int, git_only: bool = False) -> List[FileInfo]:
+    tracked: set[str] | None = None
+    if git_only:
+        tracked = git_tracked_files(repo_root)
+
     infos: List[FileInfo] = []
     for p in sorted(repo_root.rglob("*")):
         if p.is_symlink():
             continue
         if p.is_file():
+            if tracked is not None:
+                rel = str(p.relative_to(repo_root)).replace(os.sep, "/")
+                if rel not in tracked:
+                    continue
             infos.append(decide_file(p, repo_root, max_bytes))
     return infos
 
@@ -154,6 +174,74 @@ def read_text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token (GPT-family heuristic)."""
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def truncate_lines(text: str, keep_lines: int) -> tuple[str, int]:
+    """Keep first + last lines, replace middle with omission marker.
+
+    Returns (truncated_text, number_of_omitted_lines).
+    """
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    if total <= keep_lines:
+        return text, 0
+    head_n = keep_lines // 2
+    tail_n = keep_lines - head_n
+    omitted = total - keep_lines
+    head = lines[:head_n]
+    tail = lines[-tail_n:] if tail_n > 0 else []
+    marker = f"\n... ({omitted} lines omitted to fit token budget) ...\n\n"
+    return "".join(head) + marker + "".join(tail), omitted
+
+
+def load_file_contents(infos: List[FileInfo]) -> dict[str, str]:
+    """Read all included files into memory."""
+    contents: dict[str, str] = {}
+    for i in infos:
+        if i.decision.include:
+            try:
+                contents[i.rel] = read_text(i.path)
+            except Exception as e:
+                contents[i.rel] = f"Failed to read: {e}"
+    return contents
+
+
+def fit_to_token_budget(
+    contents: dict[str, str],
+    max_tokens: int,
+) -> tuple[dict[str, str], int, int]:
+    """Truncate longest files to fit within a token budget.
+
+    The directory tree and TOC are never touched — only file body content
+    gets middle-truncated, largest files first (proportional shrink).
+
+    Returns (modified_contents, total_lines_omitted, files_truncated).
+    """
+    content_budget = int(max_tokens * 0.90)
+    total_content_tokens = sum(estimate_tokens(t) for t in contents.values())
+    if total_content_tokens <= content_budget:
+        return contents, 0, 0
+
+    ratio = content_budget / total_content_tokens
+    result: dict[str, str] = {}
+    total_omitted = 0
+    files_truncated = 0
+
+    for rel, text in contents.items():
+        line_count = len(text.splitlines())
+        target_lines = max(MIN_KEEP_LINES, int(line_count * ratio))
+        truncated, omitted = truncate_lines(text, target_lines)
+        result[rel] = truncated
+        if omitted > 0:
+            total_omitted += omitted
+            files_truncated += 1
+
+    return result, total_omitted, files_truncated
+
+
 def render_markdown_text(md_text: str) -> str:
     return markdown.markdown(md_text, extensions=["fenced_code", "tables", "toc"])  # type: ignore
 
@@ -177,7 +265,11 @@ def slugify(path_str: str) -> str:
     return "".join(out)
 
 
-def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
+def generate_cxml_text(
+    infos: List[FileInfo],
+    repo_dir: pathlib.Path,
+    contents: dict[str, str] | None = None,
+) -> str:
     """Generate CXML format text for LLM consumption."""
     lines = ["<documents>"]
 
@@ -187,11 +279,13 @@ def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
         lines.append(f"<source>{i.rel}</source>")
         lines.append("<document_content>")
 
-        try:
-            text = read_text(i.path)
-            lines.append(text)
-        except Exception as e:
-            lines.append(f"Failed to read: {str(e)}")
+        if contents and i.rel in contents:
+            lines.append(contents[i.rel])
+        else:
+            try:
+                lines.append(read_text(i.path))
+            except Exception as e:
+                lines.append(f"Failed to read: {str(e)}")
 
         lines.append("</document_content>")
         lines.append("</document>")
@@ -200,7 +294,13 @@ def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: List[FileInfo]) -> str:
+def build_html(
+    repo_url: str,
+    repo_dir: pathlib.Path,
+    head_commit: str,
+    infos: List[FileInfo],
+    contents: dict[str, str] | None = None,
+) -> str:
     formatter = HtmlFormatter(nowrap=False)
     pygments_css = formatter.get_style_defs('.highlight')
 
@@ -215,7 +315,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     tree_text = try_tree_command(repo_dir)
 
     # Generate CXML text for LLM view
-    cxml_text = generate_cxml_text(infos, repo_dir)
+    cxml_text = generate_cxml_text(infos, repo_dir, contents)
 
     # Table of contents
     toc_items: List[str] = []
@@ -229,17 +329,21 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
 
     # Render file sections
     sections: List[str] = []
+    omit_marker = "lines omitted to fit token budget"
     for i in rendered:
         anchor = slugify(i.rel)
         p = i.path
         ext = p.suffix.lower()
         try:
-            text = read_text(p)
+            text = contents[i.rel] if contents and i.rel in contents else read_text(p)
+            was_truncated = omit_marker in text
             if ext in MARKDOWN_EXTENSIONS:
                 body_html = render_markdown_text(text)
             else:
                 code_html = highlight_code(text, i.rel, formatter)
                 body_html = f'<div class="highlight">{code_html}</div>'
+            if was_truncated:
+                body_html = f'<div class="truncation-banner">File truncated to fit token budget</div>{body_html}'
         except Exception as e:
             body_html = f'<pre class="error">Failed to render: {html.escape(str(e))}</pre>'
         sections.append(f"""
@@ -313,6 +417,11 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
   .back-top {{ font-size: 0.9rem; }}
   .skip-list code {{ background: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 4px; }}
   .error {{ color: #b00020; background: #fff3f3; }}
+  .truncation-banner {{
+    background: #fff8e1; border: 1px solid #ffe082; border-radius: 6px;
+    padding: 0.4rem 0.75rem; margin-bottom: 0.5rem; font-size: 0.85rem;
+    color: #6d4c00;
+  }}
 
   /* Hide duplicate top TOC on wide screens */
   .toc-top {{ display: block; }}
@@ -470,35 +579,75 @@ def derive_temp_output_path(repo_url: str) -> pathlib.Path:
     return pathlib.Path(tempfile.gettempdir()) / filename
 
 
+def is_local_path(source: str) -> bool:
+    """Return True if source looks like a local filesystem path rather than a URL."""
+    p = pathlib.Path(source)
+    return p.exists()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Flatten a GitHub repo to a single HTML page")
-    ap.add_argument("repo_url", help="GitHub repo URL (https://github.com/owner/repo[.git])")
+    ap.add_argument("source", help="GitHub repo URL or local directory path")
     ap.add_argument("-o", "--out", help="Output HTML file path (default: temporary file derived from repo name)")
     ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
+    ap.add_argument("-t", "--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max total tokens (approx) for output; 0 = unlimited. Longest files get middle-truncated to fit budget while keeping the full directory tree.")
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
     args = ap.parse_args()
 
-    # Set default output path if not provided
-    if args.out is None:
-        args.out = str(derive_temp_output_path(args.repo_url))
+    local = is_local_path(args.source)
 
-    tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
-    repo_dir = pathlib.Path(tmpdir, "repo")
+    if local:
+        source_path = pathlib.Path(args.source).resolve()
+        if source_path.is_file():
+            print(f"Error: '{args.source}' is a file, not a directory. Pass a repo directory or a GitHub URL.", file=sys.stderr)
+            return 1
+        if not source_path.is_dir():
+            print(f"Error: '{args.source}' is not a directory. Pass a repo directory or a GitHub URL.", file=sys.stderr)
+            return 1
+        repo_label = source_path.name
+    else:
+        repo_label = args.source
+
+    if args.out is None:
+        if local:
+            args.out = str(pathlib.Path(tempfile.gettempdir()) / f"{source_path.name}.html")
+        else:
+            args.out = str(derive_temp_output_path(args.source))
+
+    tmpdir: str | None = None
 
     try:
-        print(f"📁 Cloning {args.repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
-        git_clone(args.repo_url, str(repo_dir))
-        head = git_head_commit(str(repo_dir))
-        print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
+        if local:
+            repo_dir = source_path
+            head = git_head_commit(str(repo_dir))
+            print(f"📂 Using local directory: {repo_dir}", file=sys.stderr)
+            if head != "(unknown)":
+                print(f"✓ Git HEAD: {head[:8]}", file=sys.stderr)
+        else:
+            tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
+            repo_dir = pathlib.Path(tmpdir, "repo")
+            print(f"📁 Cloning {args.source} to temporary directory: {repo_dir}", file=sys.stderr)
+            git_clone(args.source, str(repo_dir))
+            head = git_head_commit(str(repo_dir))
+            print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
 
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
-        infos = collect_files(repo_dir, args.max_bytes)
+        infos = collect_files(repo_dir, args.max_bytes, git_only=local)
         rendered_count = sum(1 for i in infos if i.decision.include)
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
 
+        contents = load_file_contents(infos)
+        total_tokens = sum(estimate_tokens(t) for t in contents.values())
+        print(f"📏 Estimated {total_tokens:,} tokens across {len(contents)} files", file=sys.stderr)
+
+        if args.max_tokens > 0 and total_tokens > int(args.max_tokens * 0.90):
+            contents, omitted_lines, truncated_files = fit_to_token_budget(contents, args.max_tokens)
+            new_total = sum(estimate_tokens(t) for t in contents.values())
+            print(f"✂️  Truncated {truncated_files} files ({omitted_lines:,} lines omitted) to fit {args.max_tokens:,} token budget → ~{new_total:,} tokens", file=sys.stderr)
+
         print(f"🔨 Generating HTML...", file=sys.stderr)
-        html_out = build_html(args.repo_url, repo_dir, head, infos)
+        html_out = build_html(repo_label, repo_dir, head, infos, contents)
 
         out_path = pathlib.Path(args.out)
         print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
@@ -510,10 +659,12 @@ def main() -> int:
             print(f"🌐 Opening {out_path} in browser...", file=sys.stderr)
             webbrowser.open(f"file://{out_path.resolve()}")
 
-        print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
+        if tmpdir:
+            print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
         return 0
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
