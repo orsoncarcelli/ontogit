@@ -32,3 +32,7 @@ rendergit = "rendergit:main"
 [project.urls]
 Homepage = "https://github.com/karpathy/rendergit"
 Repository = "https://github.com/karpathy/rendergit"
+
+[tool.setuptools]
+packages = ["render"]
+py-modules = ["rendergit"]

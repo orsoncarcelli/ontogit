@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+rendergit.py
+render/__init__.py
+render/html_generator.py
+render/import_graph.py
+render/ontology.py
+render/util.py
+rendergit.egg-info/PKG-INFO
+rendergit.egg-info/SOURCES.txt
+rendergit.egg-info/dependency_links.txt
+rendergit.egg-info/entry_points.txt
+rendergit.egg-info/requires.txt
+rendergit.egg-info/top_level.txt

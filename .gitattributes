@@ -1,0 +1,10 @@
+# Enforce LF line endings for everything (standard for Python/ML repos like Karpathy's)
+* text=auto eol=lf
+
+# Explicitly for our files
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
