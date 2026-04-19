@@ -3,13 +3,13 @@ requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rendergit"
+name = "ontogit"
 version = "0.1.0"
 description = "Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F"
 readme = "README.md"
 license = "0BSD"
 authors = [
-    {name = "Andrej Karpathy"},
+    {name = "Orson Carcelli"},   # ← changed from Karpathy (optional but recommended)
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -27,12 +27,13 @@ classifiers = [
 ]
 
 [project.scripts]
-rendergit = "rendergit:main"
+ontogit = "ontogit:main"          # ← renamed command
+split-cxml = "render.cxml_split:main"   # kept for now
 
 [project.urls]
-Homepage = "https://github.com/karpathy/rendergit"
-Repository = "https://github.com/karpathy/rendergit"
+Homepage = "https://github.com/orsoncarcelli/ontogit"
+Repository = "https://github.com/orsoncarcelli/ontogit"
 
 [tool.setuptools]
 packages = ["render"]
-py-modules = ["rendergit"]
+py-modules = ["ontogit"]           # ← renamed from rendergit

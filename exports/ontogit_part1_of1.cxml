@@ -1,0 +1,921 @@
+<documents>
+<document index="1">
+<source>.gitattributes</source>
+<document_content>
+# Enforce LF line endings for everything (standard for Python/ML repos like Karpathy's)
+* text=auto eol=lf
+
+# Explicitly for our files
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+</document_content>
+</document>
+<document index="2">
+<source>README.md</source>
+<document_content>
+# rendergit
+
+> Just show me the code.
+
+Tired of clicking around complex file hierarchies of GitHub repos? Do you just want to see all of the code on a single page? Enter `rendergit`. Flatten any GitHub repository into a single, static HTML page with syntax highlighting, markdown rendering, and a clean sidebar navigation. Perfect for code review, exploration, and an instant Ctrl+F experience.
+
+## Basic usage
+
+Install and use easily with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install git+https://github.com/karpathy/rendergit
+rendergit https://github.com/karpathy/nanogpt
+```
+
+Alternatively, more manual pip install example:
+
+```bash
+git clone https://github.com/karpathy/rendergit
+cd rendergit
+pip install -e .
+rendergit https://github.com/karpathy/nanoGPT
+```
+
+The code will:
+1. Clone the repo to a temporary directory
+2. Render its source code into a single static temporary HTML file
+3. Automatically open the file in your browser
+
+Once open, you can toggle between two views:
+- **👤 Human View**: Browse with syntax highlighting, sidebar navigation, visual goodies
+- **🤖 LLM View**: Copy the entire codebase as CXML text to paste into Claude, ChatGPT, etc.
+
+There's a few other smaller options, see the code.
+
+## Features
+
+- **Dual view modes** - toggle between Human and LLM views
+  - **👤 Human View**: Pretty interface with syntax highlighting and navigation
+  - **🤖 LLM View**: Raw CXML text format - perfect for copying to Claude/ChatGPT for code analysis
+- **Syntax highlighting** for code files via Pygments
+- **Markdown rendering** for README files and docs
+- **Smart filtering** - skips binaries and oversized files
+- **Directory tree** overview at the top
+- **Sidebar navigation** with file links and sizes
+- **Responsive design** that works on mobile
+- **Search-friendly** - use Ctrl+F to find anything across all files
+
+## Contributing
+
+I vibe coded this utility a few months ago but I keep using it very often so I figured I'd just share it. I don't super intend to maintain or support it though.
+
+## License
+
+BSD0 go nuts
+
+</document_content>
+</document>
+<document index="3">
+<source>pyproject.toml</source>
+<document_content>
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rendergit"
+version = "0.1.0"
+description = "Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F"
+readme = "README.md"
+license = "0BSD"
+authors = [
+    {name = "Andrej Karpathy"},
+]
+requires-python = ">=3.10"
+dependencies = [
+    "markdown>=3.8.2",
+    "pygments>=2.19.2",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+rendergit = "rendergit:main"
+split-cxml = "render.cxml_split:main"
+
+[project.urls]
+Homepage = "https://github.com/karpathy/rendergit"
+Repository = "https://github.com/karpathy/rendergit"
+
+[tool.setuptools]
+packages = ["render"]
+py-modules = ["rendergit"]
+
+</document_content>
+</document>
+<document index="4">
+<source>rendergit.py</source>
+<document_content>
+#!/usr/bin/env python3
+"""
+Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import webbrowser
+from typing import List
+
+from render.html_generator import build_html
+from render.import_graph import build_import_graph
+from render.ontology import FileInfo, RenderDecision, is_likely_generated_path
+from render.util import bytes_human
+
+MAX_DEFAULT_BYTES = 50 * 1024
+CHARS_PER_TOKEN = 4
+MIN_KEEP_LINES = 20
+DEFAULT_MAX_TOKENS = 0  # 0 = unlimited
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".ogg", ".flac",
+    ".ttf", ".otf", ".eot", ".woff", ".woff2",
+    ".so", ".dll", ".dylib", ".class", ".jar", ".exe", ".bin",
+}
+
+
+def run(cmd: List[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+
+
+def git_clone(url: str, dst: str) -> None:
+    run(["git", "clone", "--depth", "1", url, dst])
+
+
+def git_head_commit(repo_dir: str) -> str:
+    try:
+        cp = run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+        return cp.stdout.strip()
+    except Exception:
+        return "(unknown)"
+
+
+def looks_binary(path: pathlib.Path) -> bool:
+    ext = path.suffix.lower()
+    if ext in BINARY_EXTENSIONS:
+        return True
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(8192)
+        if b"\x00" in chunk:
+            return True
+        try:
+            chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            return True
+        return False
+    except Exception:
+        return True
+
+
+def decide_file(
+    path: pathlib.Path,
+    repo_root: pathlib.Path,
+    max_bytes: int,
+    *,
+    include_generated: bool,
+) -> FileInfo:
+    rel = str(path.relative_to(repo_root)).replace(os.sep, "/")
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        size = 0
+    if "/.git/" in f"/{rel}/" or rel.startswith(".git/"):
+        return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
+    if not include_generated and is_likely_generated_path(rel):
+        return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
+    if max_bytes > 0 and size > max_bytes:
+        return FileInfo(path, rel, size, RenderDecision(False, "too_large"))
+    if looks_binary(path):
+        return FileInfo(path, rel, size, RenderDecision(False, "binary"))
+    return FileInfo(path, rel, size, RenderDecision(True, "ok"))
+
+
+def git_tracked_files(repo_root: pathlib.Path) -> set[str] | None:
+    try:
+        cp = run(["git", "ls-files"], cwd=str(repo_root))
+        return {line for line in cp.stdout.splitlines() if line}
+    except Exception:
+        return None
+
+
+def collect_files(
+    repo_root: pathlib.Path,
+    max_bytes: int,
+    git_only: bool = False,
+    *,
+    include_generated: bool = False,
+) -> List[FileInfo]:
+    tracked: set[str] | None = None
+    if git_only:
+        tracked = git_tracked_files(repo_root)
+
+    infos: List[FileInfo] = []
+    for p in sorted(repo_root.rglob("*")):
+        if p.is_symlink():
+            continue
+        if p.is_file():
+            if tracked is not None:
+                rel = str(p.relative_to(repo_root)).replace(os.sep, "/")
+                if rel not in tracked:
+                    continue
+            infos.append(decide_file(p, repo_root, max_bytes, include_generated=include_generated))
+    return infos
+
+
+def read_text(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def truncate_lines(text: str, keep_lines: int) -> tuple[str, int]:
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    if total <= keep_lines:
+        return text, 0
+    head_n = keep_lines // 2
+    tail_n = keep_lines - head_n
+    omitted = total - keep_lines
+    head = lines[:head_n]
+    tail = lines[-tail_n:] if tail_n > 0 else []
+    marker = f"\n... ({omitted} lines omitted to fit token budget) ...\n\n"
+    return "".join(head) + marker + "".join(tail), omitted
+
+
+def load_file_contents(infos: List[FileInfo]) -> dict[str, str]:
+    contents: dict[str, str] = {}
+    for i in infos:
+        if i.decision.include:
+            try:
+                contents[i.rel] = read_text(i.path)
+            except Exception as e:
+                contents[i.rel] = f"Failed to read: {e}"
+    return contents
+
+
+def fit_to_token_budget(
+    contents: dict[str, str],
+    max_tokens: int,
+) -> tuple[dict[str, str], int, int]:
+    content_budget = int(max_tokens * 0.90)
+    total_content_tokens = sum(estimate_tokens(t) for t in contents.values())
+    if total_content_tokens <= content_budget:
+        return contents, 0, 0
+
+    ratio = content_budget / total_content_tokens
+    result: dict[str, str] = {}
+    total_omitted = 0
+    files_truncated = 0
+
+    for rel, text in contents.items():
+        line_count = len(text.splitlines())
+        target_lines = max(MIN_KEEP_LINES, int(line_count * ratio))
+        truncated, omitted = truncate_lines(text, target_lines)
+        result[rel] = truncated
+        if omitted > 0:
+            total_omitted += omitted
+            files_truncated += 1
+
+    return result, total_omitted, files_truncated
+
+
+def derive_temp_output_path(repo_url: str) -> pathlib.Path:
+    parts = repo_url.rstrip("/").split("/")
+    if len(parts) >= 2:
+        repo_name = parts[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+        filename = f"{repo_name}.html"
+    else:
+        filename = "repo.html"
+
+    return pathlib.Path(tempfile.gettempdir()) / filename
+
+
+def is_local_path(source: str) -> bool:
+    p = pathlib.Path(source)
+    return p.exists()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Flatten a GitHub repo to a single HTML page",
+        epilog=(
+            "By default, common generated paths (build/, dist/, __pycache__/, .mypy_cache/, "
+            "*.egg-info/) are skipped so the outline stays readable. "
+            "Root-level *.html files are not auto-skipped. Use --include-generated to render them."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("source", help="GitHub repo URL or local directory path")
+    ap.add_argument("-o", "--out", help="Output HTML file path (default: temporary file derived from repo name)")
+    ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
+    ap.add_argument(
+        "-t",
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Max total tokens (approx) for output; 0 = unlimited. Longest files get middle-truncated to fit budget while keeping the full directory tree.",
+    )
+    ap.add_argument(
+        "--include-generated",
+        action="store_true",
+        help="Include paths normally skipped as generated (build/, dist/, egg-info, __pycache__, .mypy_cache/)",
+    )
+    ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
+    args = ap.parse_args()
+
+    local = is_local_path(args.source)
+
+    if local:
+        source_path = pathlib.Path(args.source).resolve()
+        if source_path.is_file():
+            print(f"Error: '{args.source}' is a file, not a directory. Pass a repo directory or a GitHub URL.", file=sys.stderr)
+            return 1
+        if not source_path.is_dir():
+            print(f"Error: '{args.source}' is not a directory. Pass a repo directory or a GitHub URL.", file=sys.stderr)
+            return 1
+        repo_label = source_path.name
+    else:
+        source_path = pathlib.Path()
+        repo_label = args.source
+
+    if args.out is None:
+        if local:
+            args.out = str(pathlib.Path(tempfile.gettempdir()) / f"{source_path.name}.html")
+        else:
+            args.out = str(derive_temp_output_path(args.source))
+
+    tmpdir: str | None = None
+
+    try:
+        if local:
+            repo_dir = source_path
+            head = git_head_commit(str(repo_dir))
+            print(f"📂 Using local directory: {repo_dir}", file=sys.stderr)
+            if head != "(unknown)":
+                print(f"✓ Git HEAD: {head[:8]}", file=sys.stderr)
+        else:
+            tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
+            repo_dir = pathlib.Path(tmpdir, "repo")
+            print(f"📁 Cloning {args.source} to temporary directory: {repo_dir}", file=sys.stderr)
+            git_clone(args.source, str(repo_dir))
+            head = git_head_commit(str(repo_dir))
+            print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
+
+        print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
+        infos = collect_files(
+            repo_dir,
+            args.max_bytes,
+            git_only=local,
+            include_generated=args.include_generated,
+        )
+        rendered_count = sum(1 for i in infos if i.decision.include)
+        skipped_count = len(infos) - rendered_count
+        print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
+
+        contents = load_file_contents(infos)
+        total_tokens = sum(estimate_tokens(t) for t in contents.values())
+        print(f"📏 Estimated {total_tokens:,} tokens across {len(contents)} files", file=sys.stderr)
+
+        if args.max_tokens > 0 and total_tokens > int(args.max_tokens * 0.90):
+            contents, omitted_lines, truncated_files = fit_to_token_budget(contents, args.max_tokens)
+            new_total = sum(estimate_tokens(t) for t in contents.values())
+            print(f"✂️  Truncated {truncated_files} files ({omitted_lines:,} lines omitted) to fit {args.max_tokens:,} token budget → ~{new_total:,} tokens", file=sys.stderr)
+
+        print(f"🔗 Building import graph...", file=sys.stderr)
+        import_graph = build_import_graph(infos, contents)
+        print(f"✓ Graph: {len(import_graph.nodes)} modules, {len(import_graph.edges)} imports", file=sys.stderr)
+
+        print(f"🔨 Generating HTML...", file=sys.stderr)
+        html_out = build_html(repo_label, repo_dir, head, infos, contents, import_graph)
+
+        out_path = pathlib.Path(args.out)
+        print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
+        out_path.write_text(html_out, encoding="utf-8")
+        file_size = out_path.stat().st_size
+        print(f"✓ Wrote {bytes_human(file_size)} to {out_path}", file=sys.stderr)
+
+        if not args.no_open:
+            print(f"🌐 Opening {out_path} in browser...", file=sys.stderr)
+            webbrowser.open(f"file://{out_path.resolve()}")
+
+        if tmpdir:
+            print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
+        return 0
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
+
+</document_content>
+</document>
+<document index="5">
+<source>uv.lock</source>
+<document_content>
+version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "markdown"
+version = "3.8.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d7/c2/4ab49206c17f75cb08d6311171f2d65798988db4360c4d1485bd0eedd67c/markdown-3.8.2.tar.gz", hash = "sha256:247b9a70dd12e27f67431ce62523e675b866d254f900c4fe75ce3dda62237c45", size = 362071, upload-time = "2025-06-19T17:12:44.483Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/2b/34cc11786bc00d0f04d0f5fdc3a2b1ae0b6239eef72d3d345805f9ad92a1/markdown-3.8.2-py3-none-any.whl", hash = "sha256:5c83764dbd4e00bdd94d85a19b8d55ccca20fe35b2e678a1422b380324dd5f24", size = 106827, upload-time = "2025-06-19T17:12:42.994Z" },
+]
+
+[[package]]
+name = "pygments"
+version = "2.19.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/77/a5b8c569bf593b0140bde72ea885a803b82086995367bf2037de0159d924/pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887", size = 4968631, upload-time = "2025-06-21T13:39:12.283Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/21/705964c7812476f378728bdf590ca4b771ec72385c533964653c68e86bdc/pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b", size = 1225217, upload-time = "2025-06-21T13:39:07.939Z" },
+]
+
+[[package]]
+name = "render-git"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "markdown" },
+    { name = "pygments" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "markdown", specifier = ">=3.8.2" },
+    { name = "pygments", specifier = ">=2.19.2" },
+]
+
+</document_content>
+</document>
+<document index="6">
+<source>render/__init__.py</source>
+<document_content>
+from render.html_generator import build_html, generate_cxml_text
+from render.import_graph import ImportGraph, build_import_graph
+from render.ontology import (
+    FileInfo,
+    RenderDecision,
+    assign_group,
+    flat_render_order,
+    is_likely_generated_path,
+    ordered_groups,
+)
+
+__all__ = [
+    "FileInfo",
+    "ImportGraph",
+    "RenderDecision",
+    "assign_group",
+    "build_html",
+    "build_import_graph",
+    "flat_render_order",
+    "generate_cxml_text",
+    "is_likely_generated_path",
+    "ordered_groups",
+]
+
+</document_content>
+</document>
+<document index="7">
+<source>render/html_generator.py</source>
+<document_content>
+from __future__ import annotations
+
+import html
+import json
+import pathlib
+from typing import List
+
+import markdown
+from pygments import highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import get_lexer_for_filename, TextLexer
+
+from render.ontology import FileInfo, flat_render_order, ordered_groups
+from render.import_graph import ImportGraph
+from render.util import bytes_human, slugify
+
+MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
+
+
+def read_text(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def render_markdown_text(md_text: str) -> str:
+    return markdown.markdown(md_text, extensions=["fenced_code", "tables", "toc"])  # type: ignore
+
+
+def highlight_code(text: str, filename: str, formatter: HtmlFormatter) -> str:
+    try:
+        lexer = get_lexer_for_filename(filename, stripall=False)
+    except Exception:
+        lexer = TextLexer(stripall=False)
+    return highlight(text, lexer, formatter)
+
+
+def try_tree_command(repo_dir: pathlib.Path) -> str:
+    import subprocess
+
+    try:
+        cp = subprocess.run(
+            ["tree", "-a", "."],
+            cwd=str(repo_dir),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return cp.stdout
+    except Exception:
+        return _generate_tree_fallback(repo_dir)
+
+
+def _generate_tree_fallback(root: pathlib.Path) -> str:
+    lines: list[str] = []
+
+    def walk(dir_path: pathlib.Path, prefix: str = "") -> None:
+        entries = [e for e in dir_path.iterdir() if e.name != ".git"]
+        entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
+        for i, e in enumerate(entries):
+            last = i == len(entries) - 1
+            branch = "└── " if last else "├── "
+            lines.append(prefix + branch + e.name)
+            if e.is_dir():
+                extension = "    " if last else "│   "
+                walk(e, prefix + extension)
+
+    lines.append(root.name)
+    walk(root)
+    return "\n".join(lines)
+
+
+def build_grouped_toc_html(groups: list[tuple[str, str, list[FileInfo]]]) -> str:
+    """One nested TOC snippet for sidebar and toc-top (identical HTML)."""
+    parts: list[str] = []
+    for group_id, label, files in groups:
+        gslug = slugify(group_id)
+        inner = []
+        for i in files:
+            anchor = slugify(i.rel)
+            inner.append(
+                f'<li><a href="#file-{anchor}">{html.escape(i.rel)}</a> '
+                f'<span class="muted">({bytes_human(i.size)})</span></li>'
+            )
+        inner_html = "\n".join(inner)
+        parts.append(
+            f'<li class="toc-group">'
+            f'<details open class="toc-details">'
+            f'<summary class="toc-summary">'
+            f'<a href="#group-{html.escape(gslug, quote=True)}">{html.escape(label)}</a> '
+            f'<span class="muted">({len(files)})</span>'
+            f"</summary>"
+            f'<ul class="toc toc-nested">\n{inner_html}\n</ul>'
+            f"</details>"
+            f"</li>"
+        )
+    return "\n".join(parts)
+
+
+def generate_cxml_text(
+    infos: List[FileInfo],
+    repo_dir: pathlib.Path,
+    contents: dict[str, str] | None = None,
+) -> str:
+    lines = ["<documents>"]
+    for index, i in enumerate(flat_render_order(infos), 1):
+        lines.append(f'<document index="{index}">')
+        lines.append(f"<source>{i.rel}</source>")
+        lines.append("<document_content>")
+        if contents and i.rel in contents:
+            lines.append(contents[i.rel])
+        else:
+            try:
+                lines.append(read_text(i.path))
+            except Exception as e:
+                lines.append(f"Failed to read: {str(e)}")
+        lines.append("</document_content>")
+        lines.append("</document>
+<document index="8">
+<source>render/import_graph.py</source>
+<document_content>
+"""AST-based import graph extraction for Python repos."""
+
+from __future__ import annotations
+
+import ast
+import json
+import pathlib
+from dataclasses import dataclass, field
+from typing import List
+
+from render.ontology import FileInfo
+
+
+@dataclass
+class GraphNode:
+    id: str  # relative path
+    label: str  # short display name
+    group: str  # top-level directory for coloring
+    size: int  # file size in bytes
+    lines: int  # line count
+
+
+@dataclass
+class GraphEdge:
+    source: str  # importer rel path
+    target: str  # imported rel path
+
+
+@dataclass
+class ImportGraph:
+    nodes: list[GraphNode] = field(default_factory=list)
+    edges: list[GraphEdge] = field(default_factory=list)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "nodes": [
+                    {"id": n.id, "label": n.label, "group": n.group, "size": n.size, "lines": n.lines}
+                    for n in self.nodes
+                ],
+                "links": [
+                    {"source": e.source, "target": e.target}
+                    for e in self.edges
+                ],
+            }
+        )
+
+
+def _rel_to_module(rel: str) -> str:
+    """Convert relative path to dotted module name."""
+    mod = rel.replace("/", ".")
+    if mod.endswith(".py"):
+        mod = mod[:-3]
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    return mod
+
+
+def _build_module_map(infos: List[FileInfo]) -> dict[str, str]:
+    """Map dotted module names to relative paths for all .py files.
+
+    Handles src-layout repos by also registering the path without the
+    leading ``src.`` prefix so that ``from pkg.mod`` resolves to
+    ``src/pkg/mod.py``.
+    """
+    mod_to_rel: dict[str, str] = {}
+    for info in infos:
+        if not info.decision.include:
+            continue
+        if not info.rel.endswith(".py"):
+            continue
+        mod = _rel_to_module(info.rel)
+        mod_to_rel[mod] = info.rel
+        # Also register without src. prefix for src-layout packages
+        if mod.startswith("src."):
+            mod_to_rel[mod[4:]] = info.rel
+    return mod_to_rel
+
+
+def _extract_imports(source: str) -> list[str]:
+    """Extract all imported module names from Python source using AST."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    modules: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                modules.append(node.module)
+    return modules
+
+
+def _resolve_import(
+    imported_module: str,
+    mod_map: dict[str, str],
+) -> str | None:
+    """Try to resolve an import to a file in the repo. Returns rel path or None."""
+    # Try exact match first
+    if imported_module in mod_map:
+        return mod_map[imported_module]
+    # Try progressively shorter prefixes (e.g. "foo.bar.baz" -> "foo.bar" -> "foo")
+    parts = imported_module.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        prefix = ".".join(parts[:i])
+        if prefix in mod_map:
+            return mod_map[prefix]
+    return None
+
+
+def build_import_graph(
+    infos: List[FileInfo],
+    contents: dict[str, str],
+) -> ImportGraph:
+    """Build a graph of import relationships between Python files."""
+    mod_map = _build_module_map(infos)
+    graph = ImportGraph()
+
+    # Build node set: only Python files that are rendered
+    node_ids: set[str] = set()
+    for info in infos:
+        if not info.decision.include:
+            continue
+        if not info.rel.endswith(".py"):
+            continue
+        parts = info.rel.split("/")
+        group = parts[0] if len(parts) > 1 else "__root__"
+        label = parts[-1].replace(".py", "")
+        line_count = contents.get(info.rel, "").count("\n") + 1
+        graph.nodes.append(GraphNode(
+            id=info.rel, label=label, group=group, size=info.size, lines=line_count,
+        ))
+        node_ids.add(info.rel)
+
+    # Build edges from imports
+    seen_edges: set[tuple[str, str]] = set()
+    for info in infos:
+        if not info.decision.include or not info.rel.endswith(".py"):
+            continue
+        source_text = contents.get(info.rel, "")
+        if not source_text:
+            continue
+        imports = _extract_imports(source_text)
+        for imp in imports:
+            target_rel = _resolve_import(imp, mod_map)
+            if target_rel and target_rel in node_ids and target_rel != info.rel:
+                edge_key = (info.rel, target_rel)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    graph.edges.append(GraphEdge(source=info.rel, target=target_rel))
+
+    return graph
+
+</document_content>
+</document>
+<document index="9">
+<source>render/ontology.py</source>
+<document_content>
+"""Structural repo ontology: path grouping and default generated-artifact policy.
+
+Semantic roles (agent, experiment, …) are deferred to a later phase.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+from dataclasses import dataclass
+from typing import List
+
+ROOT_GROUP_ID = "__root__"
+ROOT_GROUP_LABEL = "Root"
+
+# Prefixes (relative path, slash-separated) or segment names that default to "ignored"
+_GENERATED_PREFIXES = (
+    "build/",
+    "dist/",
+    "__pycache__/",
+    ".mypy_cache/",
+)
+_GENERATED_SEGMENT_SUFFIX = ".egg-info"
+
+
+def assign_group(rel: str) -> tuple[str, str]:
+    """Return (group_id, display_label). Root-level files use __root__ / Root."""
+    rel = rel.replace(os.sep, "/")
+    if "/" not in rel:
+        return ROOT_GROUP_ID, ROOT_GROUP_LABEL
+    first = rel.split("/", 1)[0]
+    return first, first
+
+
+def is_likely_generated_path(rel: str) -> bool:
+    """True if rel should be skipped by default (common Python/build outputs)."""
+    rel = rel.replace(os.sep, "/")
+    if rel.startswith("./"):
+        rel = rel[2:]
+    for p in _GENERATED_PREFIXES:
+        if rel == p.rstrip("/") or rel.startswith(p):
+            return True
+    for part in rel.split("/"):
+        if part.endswith(_GENERATED_SEGMENT_SUFFIX) or part == "__pycache__" or part == ".mypy_cache":
+            return True
+        if part.endswith(".egg-info"):
+            return True
+    return False
+
+
+@dataclass
+class RenderDecision:
+    include: bool
+    reason: str  # "ok" | "binary" | "too_large" | "ignored"
+
+
+@dataclass
+class FileInfo:
+    path: pathlib.Path
+    rel: str
+    size: int
+    decision: RenderDecision
+
+
+def ordered_groups(infos: List[FileInfo]) -> list[tuple[str, str, list[FileInfo]]]:
+    """Group included files by top-level segment; stable sort: Root first, then A–Z."""
+    buckets: dict[str, tuple[str, list[FileInfo]]] = {}
+    for i in infos:
+        if not i.decision.include:
+            continue
+        gid, label = assign_group(i.rel)
+        if gid not in buckets:
+            buckets[gid] = (label, [])
+        buckets[gid][1].append(i)
+
+    for _gid, (_label, files) in buckets.items():
+        files.sort(key=lambda f: f.rel)
+
+    def sort_key(gid: str) -> tuple[int, str]:
+        if gid == ROOT_GROUP_ID:
+            return (0, "")
+        return (1, gid.lower())
+
+    ordered_ids = sorted(buckets.keys(), key=sort_key)
+    return [(gid, buckets[gid][0], buckets[gid][1]) for gid in ordered_ids]
+
+
+def flat_render_order(infos: List[FileInfo]) -> list[FileInfo]:
+    """Flatten ordered_groups to the file sequence used for CXML and human body."""
+    out: list[FileInfo] = []
+    for _gid, _label, files in ordered_groups(infos):
+        out.extend(files)
+    return out
+
+</document_content>
+</document>
+<document index="10">
+<source>render/util.py</source>
+<document_content>
+"""Small string/byte helpers shared by render pipeline."""
+
+def slugify(path_str: str) -> str:
+    out: list[str] = []
+    for ch in path_str:
+        if ch.isalnum() or ch in {"-", "_"}:
+            out.append(ch)
+        else:
+            out.append("-")
+    return "".join(out)
+
+
+def bytes_human(n: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    f = float(n)
+    i = 0
+    while f >= 1024.0 and i < len(units) - 1:
+        f /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(f)} {units[i]}"
+    return f"{f:.1f} {units[i]}"
+
+</document_content>
+</document>
+</documents>

@@ -3898,26 +3898,16 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 │   │   │   └── version.meta.json
 │   │   ├── ontokernel
 │   │   │   ├── backends
-│   │   │   │   ├── __init__.data.json
-│   │   │   │   ├── __init__.meta.json
 │   │   │   │   ├── kuzu.data.json
-│   │   │   │   └── kuzu.meta.json
-│   │   │   ├── __init__.data.json
-│   │   │   ├── __init__.meta.json
+│   │   │   │   ├── kuzu.meta.json
+│   │   │   │   ├── neo4j.data.json
+│   │   │   │   ├── neo4j.meta.json
+│   │   │   │   ├── networkx.data.json
+│   │   │   │   └── networkx.meta.json
 │   │   │   ├── config.data.json
 │   │   │   ├── config.meta.json
-│   │   │   ├── enricher.data.json
-│   │   │   ├── enricher.meta.json
-│   │   │   ├── graph.data.json
-│   │   │   ├── graph.meta.json
-│   │   │   ├── migration.data.json
-│   │   │   ├── migration.meta.json
 │   │   │   ├── namespace.data.json
 │   │   │   ├── namespace.meta.json
-│   │   │   ├── protocols.data.json
-│   │   │   ├── protocols.meta.json
-│   │   │   ├── registry.data.json
-│   │   │   ├── registry.meta.json
 │   │   │   ├── schema.data.json
 │   │   │   └── schema.meta.json
 │   │   ├── ontology
@@ -9342,7 +9332,8 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 │   │   ├── zlib.data.json
 │   │   └── zlib.meta.json
 │   ├── .gitignore
-│   └── CACHEDIR.TAG
+│   ├── CACHEDIR.TAG
+│   └── missing_stubs
 ├── .pytest_cache
 │   ├── v
 │   │   └── cache
@@ -9354,8 +9345,10 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 │   └── README.md
 ├── .ruff_cache
 │   ├── 0.12.0
+│   │   ├── 14623451544932046090
 │   │   ├── 15978758640885846497
-│   │   └── 17297732425624521467
+│   │   ├── 17297732425624521467
+│   │   └── 3446096581755657140
 │   ├── .gitignore
 │   └── CACHEDIR.TAG
 ├── src
@@ -9450,6 +9443,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 │   ├── test_namespace.py
 │   ├── test_registry.py
 │   └── test_schema.py
+├── .coverage
 ├── .env
 ├── .gitattributes
 ├── .gitignore
