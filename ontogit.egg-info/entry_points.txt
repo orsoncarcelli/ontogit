@@ -1,0 +1,3 @@
+[console_scripts]
+ontogit = ontogit:main
+split-cxml = render.cxml_split:main

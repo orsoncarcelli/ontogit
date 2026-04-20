@@ -1,0 +1,15 @@
+README.md
+ontogit.py
+pyproject.toml
+ontogit.egg-info/PKG-INFO
+ontogit.egg-info/SOURCES.txt
+ontogit.egg-info/dependency_links.txt
+ontogit.egg-info/entry_points.txt
+ontogit.egg-info/requires.txt
+ontogit.egg-info/top_level.txt
+render/__init__.py
+render/cxml_split.py
+render/html_generator.py
+render/import_graph.py
+render/ontology.py
+render/util.py
